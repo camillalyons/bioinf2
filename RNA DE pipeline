@@ -1,0 +1,109 @@
+##Gettig the raw data
+file="$HOME/data/linkToDpwnload.txt"
+#this file contains the ftp to the raw data of the experiment
+while read -r line; do wget "$line" ; done < "$file"
+
+
+###step 1: QUALITY CHECK
+##we will use FASTQc to check the quality of the reads
+#we are in the home directory
+#we will first unzip the files
+cd data
+gunzip *.fastq.gz
+#now we can run FASTQc
+cd $HOME/analysis
+mkdir FASTQCresults
+FASTQCoutput="$(pwd)"/FASTQCresults
+cd $HOME/data
+
+for file in *.fastq
+do
+fastqc -f fastq -o ${FASTQCoutput} ${file}
+done
+
+
+###step 2: TRIMMING
+echo "The next step in DE analysis should be trimming the reads, if necessary. But in this simple pipeline we will skip this step."
+
+
+###step 3: READ MAPPING
+##we will use HISAT2 to map the reads
+cd $HOME/analysis
+mkdir HISAT2results
+
+cd $HOME/data
+list1="$(find . -name '*1*')"    #NB: cambia questo 1 in _1
+list2="$(find . -name '*2*')"    #NB: cambia questo 2 in _2
+listLen=${#list1[@]}
+listLen=$((listLen-1))
+
+for i in $(seq 0 ${listLen})
+do
+fullName=${list1[i]##*/}
+name=${fullName%.fastq}
+hisat2 -p 16 -x $HOME/public/index/hisat_hg38 -1 ${list1[i]} -2 ${list2[i]} -S $HOME/analysis/HISAT2results/${name}.bam 2>$HOME/analysis/HISAT2results/${name}_summary.txt
+done
+
+
+###step 4: QUANTIFICATION
+##we will use DESeq2 as software, an R package
+##Preparation of the data: building the count matrix
+cd $HOME/analysis
+mkdir quantification
+cd ~
+for file in $HOME/analysis/HISAT2results/*.bam
+do
+featureCounts -t exon -g gene -a $HOME/public/genome/GCF_000001405.38_GRCh38.p12_genomic.gff -o $HOME/analysis/quantification/readsPerGeneCounts_${name}.txt "$file"
+done
+
+cd $HOME/analysis/quantification
+R
+##once in R
+
+#preparing the count table
+fileList <- list.files(pattern=".*txt$")
+numOfFiles <- length(fileList)
+
+countdata <- read.table(fileList[[1]][1], header=FALSE)
+colnames(countdata)=countdata[1, ]
+countdata <- countdata[, c(1, ncol(countdata))]
+
+for (i in 2:numOfFiles) {
+countdataTemp <- read.table(fileList[[i]], header=FALSE)
+colnames(countdataTemp)=countdataTemp[1, ]
+countdataTemp <- countdataTemp[, c(1, ncol(countdataTemp))]
+countdata <- merge(countdata, countdataTemp, by="row.names", all=TRUE)
+    }
+colnames(countdata) <- c("Geneid", "undiff", "undiff", "undiff", "diff", "diff", "diff")
+countdata <- countdata[-1,]
+row.names(countdata) <- countdata$Geneid
+countdata[1] <- NULL
+write.csv(countdata, file="countMatrix.csv")
+cm <- read.csv("countMatrix.csv", header=TRUE, row.names=1)
+
+#allocate experimental design
+coldata <- data.frame(condition=ifesle(grep("undiff", colnames(cm)), "undifferenciated", "differenciated"))
+cm[ is.na(cm) ] = 0
+
+#running DESeq2
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(countData=cm, colData=coldata, design=~condition)
+dds <- DESeq(dds)
+
+#analyzing the results and saving the plots
+results <- results(dds)
+pdf("MAplot.pdf")
+plotMA(res, ylim=c(-2,2))
+dev.off()
+pdf("dispersion.pdf")
+plotDispEsts(dds, ylim=c(1e-6, 1e1))
+dev.off()
+pdf("pvalHist.pdf")
+hist(res$pvalue, breaks=20, col="grey")
+dev.off()
+pdf("volcanoPlot.pdf")
+EnhancedVolcano(res, lab=rownames(res), x='log2FoldChange', y='pvalue'xlim = c(-10, 10))
+dev.off()
+
+#exiting R
+q()
